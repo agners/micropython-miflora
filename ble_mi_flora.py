@@ -369,7 +369,7 @@ def demo():
             print("Charactristics we are looking for discovered")
 
             # Work around same issue here...
-            time.sleep_ms(3000)
+            time.sleep_ms(1500)
 
             # Explicitly issue reads, using "print" as the callback.
             print("Reading values")
@@ -384,6 +384,7 @@ def demo():
                 sensor_values_received = True
 
             central.read_sensor_values(callback=sensor_values)
+            time.sleep_ms(1000)
 
             firmware_values_received = False
             def firmware_values(battery, firmware_version):
