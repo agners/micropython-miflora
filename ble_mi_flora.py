@@ -6,6 +6,7 @@ import random
 import struct
 import time
 import micropython
+import machine
 
 from micropython import const
 
@@ -81,6 +82,7 @@ def decode_services(payload):
         services.append(bluetooth.UUID(u))
     return services
 
+
 class BLEMiFloraCentral:
     def __init__(self, ble):
         self._ble = ble
@@ -104,8 +106,6 @@ class BLEMiFloraCentral:
         # Callbacks for completion of various operations.
         # These reset back to None after being invoked.
         self._scan_callback = None
-        self._conn_callback = None
-        self._data_callback = None
 
         # Persistent callback for when new data is notified from the device.
         self._notify_callback = None
@@ -115,9 +115,11 @@ class BLEMiFloraCentral:
         self._start_handle = None
         self._end_handle = None
 
-        self._cmd_handle = None
-        self._data_handle = None
-        self._firm_handle = None
+        self._characteristics_handle = { }
+        self._read_status = None
+        self._read_data = None
+        self._write_status = None
+
 
     def _irq(self, event, data):
         if event == _IRQ_SCAN_RESULT:
@@ -148,8 +150,7 @@ class BLEMiFloraCentral:
             conn_handle, addr_type, addr, = data
             if addr_type == self._addr_type and addr == self._addr:
                 self._conn_handle = conn_handle
-                print("_IRQ_PERIPHERAL_CONNECT, self._ble.gattc_discover_services", addr)
-                self._ble.gattc_discover_services(self._conn_handle)
+                self._connecting = False
 
         elif event == _IRQ_PERIPHERAL_DISCONNECT:
             # Disconnect (either initiated by us or the remote end).
@@ -167,6 +168,7 @@ class BLEMiFloraCentral:
         elif event == _IRQ_GATTC_SERVICE_RESULT:
             # Connected device returned a service.
             conn_handle, start_handle, end_handle, uuid = data
+            print("_IRQ_GATTC_SERVICE_RESULT", uuid)
             if conn_handle == self._conn_handle and uuid == _ENV_FLORA_DATA_UUID:
                 self._start_handle = start_handle
                 self._end_handle = end_handle
@@ -174,42 +176,22 @@ class BLEMiFloraCentral:
         elif event == _IRQ_GATTC_CHARACTERISTIC_RESULT:
             # Connected device returned a characteristic.
             conn_handle, def_handle, value_handle, properties, uuid = data
+            print("_IRQ_GATTC_CHARACTERISTIC_RESULT", uuid)
             if conn_handle == self._conn_handle:
-                if uuid == _FLORA_CMD_CHAR:
-                    self._cmd_handle = value_handle
-                if uuid == _FLORA_DATA_CHAR:
-                    self._data_handle = value_handle
-                if uuid == _FLORA_FIRM_CHAR:
-                    self._firm_handle = value_handle
-
-                # We've finished connecting and discovering device, fire the connect callback.
-                if self._conn_callback and self.is_characteristic_discovered():
-                    self._conn_callback()
+                self._characteristics_handle[uuid] = value_handle
 
         elif event == _IRQ_GATTC_READ_RESULT:
             # A read completed successfully.
             conn_handle, value_handle, char_data = data
             print("_IRQ_GATTC_READ_RESULT", char_data)
             if conn_handle == self._conn_handle:
-                if value_handle == self._data_handle:
-                    self._decode_data(char_data)
-                    if self._data_callback:
-                        self._data_callback(self._temperature, self._lux, self._moisture, self._conductivity)
-                        self._data_callback = None
-                elif value_handle == self._firm_handle:
-                    self._decode_firm(char_data)
-                    if self._battery_callback:
-                        self._battery_callback(self._battery, self._firmware_version)
-                        self._battery_callback = None
+                self._read_data = char_data
 
         elif event == _IRQ_GATTC_WRITE_STATUS:
             conn_handle, value_handle, status = data
             print("_IRQ_GATTC_WRITE_STATUS", status)
 
-            if status == 0:
-                self._ble.gattc_read(self._conn_handle, self._data_handle)
-            elif self._data_callback:
-                self._data_callback(None, None, None, None)
+            self._write_status = status
 
     # Returns true if we've successfully connected and discovered characteristics.
     def is_connected(self):
@@ -218,18 +200,28 @@ class BLEMiFloraCentral:
     def is_connecting(self):
         return self._connecting
 
+    def discover_service(self, service_uuid):
+        print("service_discover", service_uuid)
+        self._ble.gattc_discover_service_by_uuid(self._conn_handle, service_uuid)
+
+        while not self.is_service_discovered():
+            machine.idle()
+
+        return True
+
     def is_service_discovered(self):
         return self._start_handle is not None and self._end_handle is not None
 
-    def is_characteristic_discovered(self):
-	return (self._firm_handle is not None and self._cmd_handle is not None
-                and self._data_handle is not None)
-
-    def start_characteristic_discover(self):
-        print("start_characteristic_discover")
-	self._ble.gattc_discover_characteristics(
-	    self._conn_handle, self._start_handle, self._end_handle
+    def discover_characteristic(self, chrs_uuid):
+        print("start_characteristic_discover", chrs_uuid, chrs_uuid in self._characteristics_handle)
+	self._ble.gattc_discover_characteristic_by_uuid(
+	    self._conn_handle, self._start_handle, self._end_handle, chrs_uuid
 	)
+
+        while not chrs_uuid in self._characteristics_handle:
+            machine.idle()
+
+        print("start_characteristic_discover found", self._characteristics_handle[chrs_uuid])
 
     # Find a device advertising the environmental sensor service.
     def scan(self, duration_ms=20000, callback=None):
@@ -244,66 +236,100 @@ class BLEMiFloraCentral:
         return self._devices
 
     # Connect to the specified device (otherwise use cached address from a scan).
-    def connect(self, addr_type=None, addr=None, callback=None):
+    def connect(self, addr_type=None, addr=None):
         self._addr_type = addr_type
         self._addr = addr
-        self._conn_callback = callback
         if self._addr_type is None or self._addr is None:
             return False
-        print(self._conn_handle)
-        print(self._ble.gap_connect(self._addr_type, self._addr, 5000))
+        self._ble.gap_connect(self._addr_type, self._addr, 5000)
         self._connecting = True
-        return True
+
+        while self._connecting:
+            machine.idle()
+
+        return self.is_connected()
 
     # Disconnect from current device.
     def disconnect(self):
-        if not self._conn_handle:
+        if self._conn_handle is None:
             return
+
+        print("disconnecting")
         self._ble.gap_disconnect(self._conn_handle)
 
+        while self.is_connected():
+            machine.idle()
+        print("disconnecting done!")
+
+        return True
+
+    def write(self, value_handle, value, mode=0):
+        self._ble.gattc_write(self._conn_handle, value_handle, value, mode)
+
+        while self._write_status is None:
+            machine.idle()
+
+        print("Write done, status =", self._write_status)
+        return self._write_status == 0
+
+    def read(self, value_handle):
+        self._read_data = None
+        self._ble.gattc_read(self._conn_handle, value_handle)
+
+        while self._read_data is None:
+            machine.idle()
+
+        return self._read_data
+
     # Issues an (asynchronous) write which then will trigger a read
-    def read_sensor_values(self, callback):
+    def read_sensor_values(self):
         if not self.is_connected():
             return
 
-        self._data_callback = callback
+        if not self.is_service_discovered():
+            self.discover_service(_ENV_FLORA_DATA_UUID)
+
+        if not _FLORA_CMD_CHAR in self._characteristics_handle:
+            self.discover_characteristic(_FLORA_CMD_CHAR)
+
+        time.sleep_ms(300)
+        print("Writing read sensor command...")
         value = struct.pack("<h", 0x1fa0)
-        self._ble.gattc_write(self._conn_handle, self._cmd_handle, value, 1)
+        if not self.write(self._characteristics_handle[_FLORA_CMD_CHAR], value, 1):
+            raise Exception("Write failed")
 
-    def read_firmware(self, callback):
+        if not _FLORA_DATA_CHAR in self._characteristics_handle:
+            self.discover_characteristic(_FLORA_DATA_CHAR)
+
+        time.sleep_ms(1000)
+        self.read(self._characteristics_handle[_FLORA_DATA_CHAR])
+
+        (temp, pad, lux, moisture, cond) =  struct.unpack("<hBIBH", self._read_data)
+        temp = float(temp) / 10
+        return (temp, lux, moisture, cond)
+
+
+    def read_firmware(self):
         if not self.is_connected():
             return
 
-        self._battery_callback = callback
-        self._ble.gattc_read(self._conn_handle, self._firm_handle)
+        if not self.is_service_discovered():
+            self.discover_service(_ENV_FLORA_DATA_UUID)
 
-    # Sets a callback to be invoked when the device notifies us.
-    def on_notify(self, callback):
-        self._notify_callback = callback
+        if not _FLORA_FIRM_CHAR in self._characteristics_handle:
+            self.discover_characteristic(_FLORA_FIRM_CHAR)
 
-    def _decode_data(self, data):
-        temp, padding, lux, moisture, conductivity = struct.unpack("<hBIBH", data)
-        print(temp, lux, moisture, conductivity)
-        self._temperature = float(temp) / 10
-        self._lux = lux
-        self._moisture = moisture
-        self._conductivity = conductivity
+        time.sleep_ms(300)
+        print("Reading firmware...")
+        self.read(self._characteristics_handle[_FLORA_FIRM_CHAR])
 
-    def _decode_firm(self, data):
-        battery, padding, firmware_version = struct.unpack("BB5s", data)
-        print("Battery", battery, firmware_version)
-        self._battery = battery
-        self._firmware_version = firmware_version
+        battery, padding, firmware_version = struct.unpack("BB5s", self._read_data)
+        return (battery, firmware_version)
 
     def value(self):
         return self._value
 
-
-def demo():
-    ble = bluetooth.BLE()
-    ble.active(True)
-    central = BLEMiFloraCentral(ble)
-
+def scan(central):
     print("Scanning for Mi Flora devices...")
     central.scan(duration_ms=5000)
 
@@ -316,104 +342,44 @@ def demo():
         addr_type, addr = device_key
         print("MAC: ", "".join('{:02x}:'.format(x) for x in addr)[:-1])
 
+    return central.get_devices()
+
+def demo():
+    ble = bluetooth.BLE()
+    ble.active(True)
+    central = BLEMiFloraCentral(ble)
+
+    devices = scan(central)
+
+    # Use hardcoded list:
+    #devices = {
+    #        (0, b'\x80\xea\xca\x88\xd5\x82'): "Device 1",
+    #        (0, b'\x80\xea\xca\x88\xd4\x69'): "Device 2",
+    #        }
+
     # Now get sensor values for each device
-    for device_key, device_name in central.get_devices().items():
+    for device_key, device_name in devices.items():
         addr_type, addr = device_key
 
         # Connetion is not always successful, so try multiple times...
-        for attempt in range(5):
-            if not attempt == 0:
-                print("Connection unsuccessful (attempt {0})".format(attempt + 1))
-                central.disconnect()
-                while central.is_connected():
-                    time.sleep_ms(100)
+        print("Connecting to ", "".join('{:02x}:'.format(x) for x in addr)[:-1])
+        while not central.connect(addr_type, addr):
+            print("Connection failed, retrying")
 
-                time.sleep_ms(1000)
+        print("Connected")
 
-            print("Connecting to ", "".join('{:02x}:'.format(x) for x in addr)[:-1])
-            central.connect(addr_type, addr)
+        (temperature, light, moisture, conductivity) = central.read_sensor_values()
+        print("Temperature: {0}°C".format(temperature))
+        print("Light: {0} lux".format(light))
+        print("Moisture: {0}%".format(moisture))
+        print("Conductivity: {0}uS/cm".format(conductivity))
 
-            # Wait for connection...
-            while not central.is_connected() and central.is_connecting():
-                time.sleep_ms(100)
+        battery, firmware_version = central.read_firmware()
+        print("Battery: {0}%".format(battery))
+        print("Firmware Version: {0}".format(firmware_version))
+        central.disconnect()
 
-            if not central.is_connected():
-                continue
-
-            print("Connected")
-
-            # Wait for service discovery...
-            while not central.is_service_discovered() and central.is_connected():
-                time.sleep_ms(100)
-                print(".")
-
-            if not central.is_connected():
-                continue
-            print("Service discovered main loop")
-
-            # Work around bug in ESP IDF NimBLE implementation:
-            # Wait for service discovery to complete before triggering charactristic
-            # discovery.
-            # https://github.com/espressif/esp-idf/issues/4913
-            time.sleep_ms(1500)
-
-            central.start_characteristic_discover()
-
-            while not central.is_characteristic_discovered() and central.is_connected():
-                time.sleep_ms(100)
-                print(".")
-
-            if not central.is_connected():
-                continue
-
-            print("Charactristics we are looking for discovered")
-
-            # Work around same issue here...
-            time.sleep_ms(1500)
-
-            # Explicitly issue reads, using "print" as the callback.
-            print("Reading values")
-
-            sensor_values_received = False
-            def sensor_values(temperature, light, moisture, conductivity):
-                print("Temperature: {0}°C".format(temperature))
-                print("Light: {0} lux".format(light))
-                print("Moisture: {0}%".format(moisture))
-                print("Conductivity: {0}uS/cm".format(conductivity))
-                nonlocal sensor_values_received
-                sensor_values_received = True
-
-            central.read_sensor_values(callback=sensor_values)
-            time.sleep_ms(1000)
-
-            firmware_values_received = False
-            def firmware_values(battery, firmware_version):
-                print("Battery: {0}%".format(battery))
-                print("Firmware Version: {0}".format(firmware_version))
-                nonlocal firmware_values_received
-                firmware_values_received = True
-
-            central.read_firmware(callback=firmware_values)
-
-            while ((not sensor_values_received or not firmware_values_received)
-                   and central.is_connected()):
-                time.sleep_ms(100)
-                print(".")
-
-            if not central.is_connected():
-                continue
-            central.disconnect()
-
-            # This is important otherwise the BLE stack won't allow us to
-            # connect to another device.
-            while central.is_connected():
-                time.sleep_ms(100)
-
-            print("Disconnected")
-
-            # Successful attempt, break retry looop
-            break
-
+        time.sleep(5)
 
 if __name__ == "__main__":
     demo()
